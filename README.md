@@ -35,9 +35,27 @@ python server.py
 
 ## Usage
 
-1. 서버 시작: `python server.py`
-2. ngrok 터널: `ngrok http 8770`
-3. ChatGPT Desktop에 URL 등록
+### 1. 서버 시작
+```bash
+python server.py
+# Server running on http://127.0.0.1:8780
+```
+
+### 2. ngrok 터널 (개별 사용 시)
+```bash
+ngrok http 8780
+```
+
+### 3. ChatGPT Desktop 설정
+
+| 항목 | 값 |
+|------|-----|
+| **Name** | `QualMaster` |
+| **Description** | `정성연구 방법론 전문가. 질적 연구 패러다임, 연구 전통(현상학, 근거이론, 문화기술지 등), 코딩 가이드, 논문 심사 및 수정, 저널 투고 전략을 지원합니다.` |
+| **URL** | `https://[your-ngrok-url]/mcp` (개별) 또는 `https://[gateway-ngrok-url]/qualmaster/mcp` (게이트웨이) |
+
+#### Gateway 사용 시
+[gpt-mcp-launcher](https://github.com/seanshin0214/gpt-mcp-launcher) 게이트웨이를 통해 여러 MCP 서버를 하나의 ngrok URL로 관리할 수 있습니다.
 
 ## 12 MCP Tools
 
