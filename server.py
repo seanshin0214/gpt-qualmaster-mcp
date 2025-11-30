@@ -16,7 +16,8 @@ from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+import asyncio
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -36,6 +37,86 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ChromaDB Configuration
+CHROMA_URL = os.environ.get("CHROMA_URL", "http://localhost:8000")
+chroma_client = None
+embedding_model = None
+
+def init_chromadb():
+    """Initialize ChromaDB connection"""
+    global chroma_client, embedding_model
+    if not CHROMADB_AVAILABLE:
+        logger.warning("ChromaDB not installed - RAG search disabled")
+        return False
+    try:
+        chroma_client = chromadb.HttpClient(host="localhost", port=8000)
+        # Test connection
+        chroma_client.heartbeat()
+        logger.info(f"ChromaDB connected at {CHROMA_URL}")
+
+        if SENTENCE_TRANSFORMER_AVAILABLE:
+            embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("Sentence Transformer loaded")
+        return True
+    except Exception as e:
+        logger.warning(f"ChromaDB connection failed: {e}")
+        chroma_client = None
+        return False
+
+def safe_decode(text):
+    """Safely decode text to UTF-8"""
+    if isinstance(text, bytes):
+        try:
+            return text.decode('utf-8')
+        except UnicodeDecodeError:
+            try:
+                return text.decode('cp949')
+            except:
+                return text.decode('utf-8', errors='ignore')
+    return str(text) if text else ""
+
+def search_chromadb(query: str, n_results: int = 5) -> List[dict]:
+    """Search ChromaDB for relevant documents"""
+    if not chroma_client:
+        return []
+
+    results = []
+    collections_to_search = [
+        "qualmaster_methods",
+        "qualmaster_paradigms",
+        "qualmaster_traditions",
+        "qualmaster_journals",
+        "qualmaster_exemplars",
+        "qualmaster_cases"
+    ]
+
+    for coll_name in collections_to_search:
+        try:
+            collection = chroma_client.get_collection(name=coll_name)
+            query_result = collection.query(
+                query_texts=[query],
+                n_results=n_results
+            )
+
+            if query_result and query_result.get("documents"):
+                for i, doc in enumerate(query_result["documents"][0]):
+                    metadata = query_result.get("metadatas", [[]])[0][i] if query_result.get("metadatas") else {}
+                    distance = query_result.get("distances", [[]])[0][i] if query_result.get("distances") else None
+                    # Safe decode all text fields
+                    results.append({
+                        "content": safe_decode(doc),
+                        "source": safe_decode(metadata.get("source", coll_name)),
+                        "title": safe_decode(metadata.get("title", "")),
+                        "distance": distance
+                    })
+        except Exception as e:
+            logger.debug(f"Collection {coll_name} search failed: {e}")
+            continue
+
+    # Sort by distance (lower is better)
+    results.sort(key=lambda x: x.get("distance", float("inf")))
+    return results[:n_results]
 
 
 # ============================================================================
@@ -400,17 +481,30 @@ TOOLS = [
     },
     {
         "name": "assess_quality",
-        "description": "질적연구의 품질을 평가하기 위한 기준과 전략을 제공합니다.",
+        "description": """질적연구의 품질을 Lincoln & Guba + Tracy 기준으로 실제 평가합니다.
+
+연구 설명과 사용 전략을 입력하면 100점 만점으로 점수를 산출합니다.
+- Lincoln & Guba: 신빙성, 전이가능성, 의존가능성, 확인가능성
+- Tracy: 가치있는 주제, 풍부한 엄격성, 성실성, 신빙성, 공명, 의미있는 기여, 윤리성, 의미있는 일관성""",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "criterion": {
+                "research_description": {
                     "type": "string",
-                    "enum": ["credibility", "transferability", "dependability", "confirmability", "all"],
-                    "description": "평가 기준"
+                    "description": "연구 설명 (방법론, 데이터 수집, 분석 절차 등)"
+                },
+                "strategies_used": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "사용한 품질 전략 목록 (예: 삼각검증, 참여자확인, 감사추적 등)"
+                },
+                "criteria": {
+                    "type": "string",
+                    "enum": ["lincoln_guba", "tracy", "all"],
+                    "description": "평가 기준 (기본값: all)"
                 }
             },
-            "required": ["criterion"]
+            "required": ["research_description"]
         }
     },
     {
@@ -512,12 +606,14 @@ TOOLS = [
 # ============================================================================
 
 def handle_search_knowledge(args: dict) -> str:
-    """지식 검색"""
+    """지식 검색 - 내장 지식 + ChromaDB RAG 통합"""
     query = args.get("query", "").lower()
+    original_query = args.get("query", "")
     category = args.get("category")
 
     results = []
 
+    # 1. 내장 지식베이스 검색
     # 패러다임 검색
     if not category or category == "paradigms":
         for key, p in PARADIGMS.items():
@@ -548,10 +644,24 @@ def handle_search_knowledge(args: dict) -> str:
             if query in key or query in r["name"].lower():
                 results.append(f"**{r['name']}**\n- 증상: {', '.join(r['symptoms'])}")
 
-    if results:
-        return f"## '{args.get('query')}' 검색 결과\n\n" + "\n\n---\n\n".join(results)
+    # 2. ChromaDB RAG 검색 (추가 컨텍스트)
+    rag_results = search_chromadb(original_query, n_results=5)
+    rag_section = ""
+    if rag_results:
+        rag_section = "\n\n---\n\n## 📚 RAG 지식베이스 검색 결과\n\n"
+        for i, r in enumerate(rag_results[:3], 1):
+            content_preview = r["content"][:500] + "..." if len(r["content"]) > 500 else r["content"]
+            title = r.get("title", "")
+            rag_section += f"### {i}. {title}\n{content_preview}\n\n"
+
+    if results or rag_results:
+        output = f"## '{original_query}' 검색 결과\n\n"
+        if results:
+            output += "\n\n---\n\n".join(results)
+        output += rag_section
+        return output
     else:
-        return f"'{args.get('query')}'에 대한 결과를 찾을 수 없습니다.\n\n사용 가능한 카테고리: paradigms, traditions, coding, quality, journals, rejection"
+        return f"'{original_query}'에 대한 결과를 찾을 수 없습니다.\n\n사용 가능한 카테고리: paradigms, traditions, coding, quality, journals, rejection\n\n💡 ChromaDB 연결 상태: {'✅ 연결됨' if chroma_client else '❌ 연결 안됨'}"
 
 
 def handle_get_paradigm(args: dict) -> str:
@@ -677,28 +787,367 @@ def handle_get_coding_guide(args: dict) -> str:
     return output
 
 
-def handle_assess_quality(args: dict) -> str:
-    """품질 평가"""
-    criterion = args.get("criterion", "all")
-    criteria = QUALITY_CRITERIA["trustworthiness"]
+def normalize_text(text: str) -> str:
+    """텍스트 정규화 - 띄어쓰기, 언더스코어 등을 무시하고 비교"""
+    import re
+    normalized = text.lower()
+    normalized = re.sub(r'[\s_\-]', '', normalized)  # 공백, 언더스코어, 하이픈 제거
+    normalized = normalized.replace('검증', '검토')  # 검증과 검토를 동일하게 처리
+    return normalized
 
-    if criterion == "all":
-        output = "## 질적연구 신뢰성 기준 (Trustworthiness)\n\n"
-        for key, c in criteria.items():
-            output += f"### {c['name']}\n"
-            output += f"- **양적 동등개념**: {c['quantitative_equivalent']}\n"
-            output += f"- **전략**:\n" + "\n".join([f"  - {s}" for s in c['strategies']]) + "\n\n"
+
+def assess_lincoln_guba(description: str, strategies: List[str]) -> List[dict]:
+    """Lincoln & Guba 기준 평가"""
+    lower_desc = description.lower()
+    normalized_desc = normalize_text(description)
+    normalized_strategies = [normalize_text(s) for s in strategies]
+
+    criteria = [
+        {
+            "criterion": "credibility",
+            "korean": "신빙성 (Credibility)",
+            "strategies": [
+                {
+                    "name": "prolonged_engagement",
+                    "korean": "장기적 관여",
+                    "keywords": ["장기", "오랜기간", "prolonged", "7일", "14일", "집중적관여", "지속적"]
+                },
+                {
+                    "name": "triangulation",
+                    "korean": "삼각화/삼각검증",
+                    "keywords": ["삼각화", "삼각검증", "triangulation", "다중자료", "3중", "인터뷰+저널", "다중출처"]
+                },
+                {
+                    "name": "peer_debriefing",
+                    "korean": "동료 검토",
+                    "keywords": ["동료검토", "동료검증", "peer", "debriefing", "동료연구자"]
+                },
+                {
+                    "name": "member_checking",
+                    "korean": "참여자 확인",
+                    "keywords": ["참여자확인", "membercheck", "memberchecking", "참여자검토", "2단계확인"]
+                },
+                {
+                    "name": "negative_case",
+                    "korean": "부정적 사례 분석",
+                    "keywords": ["부정적사례", "negativecase", "반증", "방해경험", "부정사례"]
+                }
+            ]
+        },
+        {
+            "criterion": "transferability",
+            "korean": "전이가능성 (Transferability)",
+            "strategies": [
+                {
+                    "name": "thick_description",
+                    "korean": "두꺼운 기술",
+                    "keywords": ["두꺼운기술", "thickdescription", "상세기술", "풍부한기술"]
+                },
+                {
+                    "name": "purposeful_sampling",
+                    "korean": "목적적 표본추출",
+                    "keywords": ["목적적", "purposeful", "의도적표집", "목적표집", "목적적표본", "목적표본"]
+                },
+                {
+                    "name": "context_description",
+                    "korean": "맥락 기술",
+                    "keywords": ["맥락", "context", "배경", "상황기술", "맥락상세", "맥락체크리스트"]
+                }
+            ]
+        },
+        {
+            "criterion": "dependability",
+            "korean": "의존가능성 (Dependability)",
+            "strategies": [
+                {
+                    "name": "audit_trail",
+                    "korean": "감사 추적",
+                    "keywords": ["감사추적", "audittrail", "연구일지", "감사로그", "추적로그"]
+                },
+                {
+                    "name": "code_recode",
+                    "korean": "코드-재코드",
+                    "keywords": ["재코드", "recode", "반복코딩", "코드재코드", "일치율", "코딩일치"]
+                },
+                {
+                    "name": "peer_examination",
+                    "korean": "동료 검증",
+                    "keywords": ["동료검증", "동료검토", "peerexamination", "동료심사"]
+                }
+            ]
+        },
+        {
+            "criterion": "confirmability",
+            "korean": "확인가능성 (Confirmability)",
+            "strategies": [
+                {
+                    "name": "reflexivity",
+                    "korean": "반성성/성찰",
+                    "keywords": ["반성", "reflexiv", "성찰", "반성적저널", "위치성", "저널링"]
+                },
+                {
+                    "name": "audit_trail",
+                    "korean": "감사 추적",
+                    "keywords": ["감사추적", "audittrail", "감사로그"]
+                },
+                {
+                    "name": "triangulation",
+                    "korean": "삼각화/삼각검증",
+                    "keywords": ["삼각화", "삼각검증", "triangulation", "3중"]
+                }
+            ]
+        }
+    ]
+
+    results = []
+    for c in criteria:
+        applied = []
+        missing = []
+
+        for strategy in c["strategies"]:
+            # description에서 키워드 찾기
+            found_in_desc = any(
+                normalize_text(k) in normalized_desc or k.lower() in lower_desc
+                for k in strategy["keywords"]
+            )
+
+            # strategies_used 배열에서 찾기
+            found_in_strategies = any(
+                any(normalize_text(k) in s or s in normalize_text(k) for k in strategy["keywords"])
+                for s in normalized_strategies
+            )
+
+            if found_in_desc or found_in_strategies:
+                applied.append(strategy["korean"])
+            else:
+                missing.append(strategy["korean"])
+
+        score = round((len(applied) / len(c["strategies"])) * 25)
+
+        results.append({
+            "criterion": c["criterion"],
+            "korean": c["korean"],
+            "score": score,
+            "max_score": 25,
+            "strategies_applied": applied,
+            "missing_strategies": missing,
+            "recommendations": [f"{m} 전략을 추가로 적용하세요" for m in missing] if missing else []
+        })
+
+    return results
+
+
+def assess_tracy(description: str, strategies: List[str]) -> List[dict]:
+    """Tracy 8가지 기준 평가"""
+    lower_desc = description.lower()
+    normalized_desc = normalize_text(description)
+    normalized_strategies = [normalize_text(s) for s in strategies]
+
+    criteria = [
+        {
+            "criterion": "worthy_topic",
+            "korean": "가치있는 주제",
+            "indicators": [
+                "중요", "시의적절", "필요", "기여", "문제", "의미", "가치",
+                "새로운현상", "AI", "리더", "의사결정", "탐구", "연구목적"
+            ]
+        },
+        {
+            "criterion": "rich_rigor",
+            "korean": "풍부한 엄격성",
+            "indicators": [
+                "충분한", "다양한", "적절한", "체계적", "면밀한", "엄격",
+                "IPA", "6단계", "다중사례", "심층", "분석절차", "브라케팅"
+            ]
+        },
+        {
+            "criterion": "sincerity",
+            "korean": "성실성",
+            "indicators": [
+                "반성", "성찰", "한계", "투명", "정직", "위치성",
+                "반성적저널", "저널링", "솔직"
+            ]
+        },
+        {
+            "criterion": "credibility",
+            "korean": "신빙성",
+            "indicators": [
+                "삼각", "참여자확인", "두꺼운기술", "구체적", "검증",
+                "membercheck", "삼각검증", "동료검토"
+            ]
+        },
+        {
+            "criterion": "resonance",
+            "korean": "공명",
+            "indicators": [
+                "전이", "일반화", "독자", "영향", "감동", "공감",
+                "경험", "의미", "본질", "통찰"
+            ]
+        },
+        {
+            "criterion": "significant_contribution",
+            "korean": "의미있는 기여",
+            "indicators": [
+                "기여", "확장", "새로운", "발전", "함의", "이론적",
+                "실무적", "통찰", "제안"
+            ]
+        },
+        {
+            "criterion": "ethics",
+            "korean": "윤리성",
+            "indicators": [
+                "윤리", "동의", "익명", "보호", "IRB", "승인",
+                "동의서", "철회", "민감정보", "익명화"
+            ]
+        },
+        {
+            "criterion": "meaningful_coherence",
+            "korean": "의미있는 일관성",
+            "indicators": [
+                "일관", "연결", "목적", "방법론", "통합", "적합",
+                "IPA", "현상학", "연구질문", "분석"
+            ]
+        }
+    ]
+
+    results = []
+    for c in criteria:
+        # description과 strategies 모두에서 indicator 찾기
+        found_indicators = [
+            ind for ind in c["indicators"]
+            if normalize_text(ind) in normalized_desc or
+               ind.lower() in lower_desc or
+               any(normalize_text(ind) in s for s in normalized_strategies)
+        ]
+
+        missing_indicators = [
+            ind for ind in c["indicators"]
+            if normalize_text(ind) not in normalized_desc and
+               ind.lower() not in lower_desc and
+               not any(normalize_text(ind) in s for s in normalized_strategies)
+        ]
+
+        # 점수 계산 - 최소 1개만 매치되어도 부분 점수 부여
+        match_ratio = len(found_indicators) / len(c["indicators"])
+        score = round(match_ratio * 13)
+
+        results.append({
+            "criterion": c["criterion"],
+            "korean": c["korean"],
+            "score": score,
+            "max_score": 13,
+            "strategies_applied": found_indicators,
+            "missing_strategies": missing_indicators[:3],  # 상위 3개만 표시
+            "recommendations": [f"{c['korean']} 관련 내용을 보강하세요"] if score < 10 and len(found_indicators) < 3 else []
+        })
+
+    return results
+
+
+def get_grade(percentage: float) -> str:
+    """등급 계산"""
+    if percentage >= 90:
+        return "A (우수)"
+    elif percentage >= 80:
+        return "B (양호)"
+    elif percentage >= 70:
+        return "C (보통)"
+    elif percentage >= 60:
+        return "D (미흡)"
     else:
-        if criterion not in criteria:
-            return f"알 수 없는 기준: {criterion}\n사용 가능: {', '.join(criteria.keys())}, all"
-        c = criteria[criterion]
-        output = f"## {c['name']}\n\n"
-        output += f"**양적 동등개념**: {c['quantitative_equivalent']}\n\n"
-        output += "### 확보 전략\n"
-        for s in c['strategies']:
-            output += f"- {s}\n"
+        return "F (개선 필요)"
 
-    return output
+
+def get_priority_actions(assessments: List[dict]) -> List[str]:
+    """우선 조치 사항"""
+    return [
+        f"{a['korean']} 개선: {a['recommendations'][0] if a['recommendations'] else '전략 추가 필요'}"
+        for a in assessments
+        if a['score'] / a['max_score'] < 0.5
+    ][:3]
+
+
+def handle_assess_quality(args: dict) -> str:
+    """품질 평가 - Lincoln & Guba + Tracy 기준으로 실제 점수 산출"""
+    research_description = args.get("research_description", "")
+    strategies_used = args.get("strategies_used", [])
+    criteria = args.get("criteria", "all")
+
+    if not research_description:
+        return "연구 설명(research_description)을 입력해주세요."
+
+    assessments = []
+
+    if criteria == "lincoln_guba" or criteria == "all":
+        assessments.extend(assess_lincoln_guba(research_description, strategies_used))
+
+    if criteria == "tracy" or criteria == "all":
+        assessments.extend(assess_tracy(research_description, strategies_used))
+
+    # 전체 점수 계산
+    total_score = sum(a["score"] for a in assessments)
+    max_score = sum(a["max_score"] for a in assessments)
+    overall_percentage = (total_score / max_score) * 100 if max_score > 0 else 0
+
+    # 강점/약점 식별
+    strengths = [a["korean"] for a in assessments if a["score"] / a["max_score"] >= 0.7]
+    weaknesses = [a["korean"] for a in assessments if a["score"] / a["max_score"] < 0.5]
+
+    # 결과 구성
+    result = {
+        "criteria_used": criteria,
+        "input_summary": {
+            "description_length": len(research_description),
+            "strategies_reported": len(strategies_used)
+        },
+        "overall_assessment": {
+            "score": f"{total_score}/{max_score}",
+            "percentage": f"{overall_percentage:.1f}%",
+            "grade": get_grade(overall_percentage)
+        },
+        "detailed_assessment": [
+            {
+                "criterion": a["criterion"],
+                "korean": a["korean"],
+                "score": f"{a['score']}/{a['max_score']}",
+                "strategies_applied": a["strategies_applied"],
+                "missing_strategies": a["missing_strategies"],
+                "recommendations": a["recommendations"]
+            }
+            for a in assessments
+        ],
+        "summary": {
+            "strengths": strengths,
+            "weaknesses": weaknesses,
+            "priority_actions": get_priority_actions(assessments)
+        },
+        "quality_enhancement_guide": {
+            "immediate_actions": [
+                "연구 설계 단계에서 품질 전략을 계획하세요",
+                "연구 일지를 꾸준히 작성하세요",
+                "동료 연구자와 정기적으로 토론하세요"
+            ],
+            "during_data_collection": [
+                "참여자와 충분한 라포를 형성하세요",
+                "면담 후 즉시 메모를 작성하세요",
+                "다양한 자료원을 활용하세요"
+            ],
+            "during_analysis": [
+                "코딩의 일관성을 검토하세요",
+                "참여자 확인(member checking)을 실시하세요",
+                "부정적 사례를 적극적으로 찾으세요"
+            ],
+            "writing_phase": [
+                "두꺼운 기술로 맥락을 풍부하게 제시하세요",
+                "연구자의 위치성을 명시하세요",
+                "한계를 솔직하게 논의하세요"
+            ]
+        }
+    }
+
+    # JSON 형식으로 반환 (가독성 있게)
+    import json
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 def handle_get_journal_guide(args: dict) -> str:
@@ -977,6 +1426,13 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 50)
     logger.info("GPT QualMaster MCP Server Starting")
     logger.info("12 tools available for qualitative research")
+
+    # Initialize ChromaDB
+    if init_chromadb():
+        logger.info("✅ ChromaDB RAG search enabled")
+    else:
+        logger.warning("⚠️ ChromaDB not available - using embedded knowledge only")
+
     logger.info("=" * 50)
     yield
     logger.info("Server shutting down")
@@ -1012,6 +1468,46 @@ async def health():
     return {"status": "healthy", "tools": len(TOOLS)}
 
 
+@app.get("/mcp")
+async def mcp_sse_endpoint(request: Request):
+    """SSE endpoint for GPT MCP connections"""
+    # Get the base URL from the request
+    host = request.headers.get("host", "localhost:8780")
+    scheme = request.headers.get("x-forwarded-proto", "http")
+    base_url = f"{scheme}://{host}"
+
+    async def event_generator():
+        # First, send the endpoint event (MCP SSE protocol requirement)
+        yield f"event: endpoint\ndata: {base_url}/mcp\n\n"
+
+        # Send server info as a message
+        init_event = {
+            "jsonrpc": "2.0",
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": SERVER_INFO,
+                "capabilities": {"tools": {}}
+            },
+            "id": 0
+        }
+        yield f"event: message\ndata: {json.dumps(init_event)}\n\n"
+
+        # Keep connection alive
+        while True:
+            await asyncio.sleep(30)
+            yield f": keepalive\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
     try:
@@ -1037,7 +1533,12 @@ async def mcp_endpoint(request: Request):
 
         elif body.get("method") == "tools/call":
             params = body.get("params", {})
-            result = await handle_tool_call(params.get("name"), params.get("arguments", {}))
+            tool_name = params.get("name", "")
+            # Defensive coding: arguments가 None이거나 없는 경우 빈 딕셔너리로 처리
+            arguments = params.get("arguments")
+            if arguments is None or not isinstance(arguments, dict):
+                arguments = {}
+            result = await handle_tool_call(tool_name, arguments)
             return JSONResponse({
                 "jsonrpc": "2.0",
                 "result": result,
@@ -1065,15 +1566,15 @@ def main():
     print("  GPT QualMaster MCP Server v1.0.0")
     print("  AI-Powered Qualitative Research Assistant")
     print("=" * 60)
-    print("  URL: http://127.0.0.1:8770")
-    print("  ngrok: ngrok http 8770")
+    print("  URL: http://127.0.0.1:8780")
+    print("  ngrok: ngrok http 8780")
     print("-" * 60)
     print("  12 Tools:")
     for t in TOOLS:
         print(f"    - {t['name']}")
     print("=" * 60 + "\n")
 
-    uvicorn.run(app, host="127.0.0.1", port=8770, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=8780, log_level="info")
 
 
 if __name__ == "__main__":
