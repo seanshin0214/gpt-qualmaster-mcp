@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.1.1] - 2025-12-07 (Hotfix)
+
+### Added
+- **개념논문 작성 지식 추가** (6개 문서)
+  - Gerring (1999) - What Makes a Concept Good? (8가지 기준)
+  - Suddaby (2010) - Construct Clarity in Theories (AMR Editor's Comments)
+  - Podsakoff et al. (2016) - Recommendations for Creating Better Concept Definitions
+  - Whetten (1989) - What Constitutes a Theoretical Contribution?
+  - Corley & Gioia (2011) - Building Theory about Theory Building
+  - Conceptual Mechanisms - 심리적/사회적/구조적 메커니즘
+
+### Changed
+- VectorDB 문서 수: 20 → 26개
+- RAG 검색 품질 검증 완료 (Podsakoff, Suddaby 등 정석 레퍼런스 반환 확인)
+
 ## [1.1.0] - 2025-12-07
 
 ### Fixed
