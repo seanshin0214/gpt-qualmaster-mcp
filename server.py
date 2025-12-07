@@ -38,30 +38,100 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ChromaDB Configuration
-CHROMA_URL = os.environ.get("CHROMA_URL", "http://localhost:8000")
-chroma_client = None
-embedding_model = None
+# ChromaDB Configuration - PersistentClient (Local Storage)
+BASE_DIR = Path(__file__).parent
+CHROMA_PATH = BASE_DIR / "data" / "chroma_db"
+
+
+class QualMasterVectorStore:
+    """RAG 벡터 스토어 - ChromaDB PersistentClient 기반"""
+
+    def __init__(self, chroma_path: str):
+        self._client = None
+        self._collection = None
+        self._encoder = None
+        self._chroma_path = chroma_path
+
+    @property
+    def encoder(self):
+        if self._encoder is None and SENTENCE_TRANSFORMER_AVAILABLE:
+            self._encoder = SentenceTransformer('all-MiniLM-L6-v2')
+        return self._encoder
+
+    @property
+    def collection(self):
+        if self._collection is None:
+            self._client = chromadb.PersistentClient(path=self._chroma_path)
+            self._collection = self._client.get_collection("qualmaster_knowledge")
+            logger.info(f"Vector store loaded: {self._collection.count()} documents")
+        return self._collection
+
+    def search(self, query: str, n_results: int = 5, category: str = None) -> List[Dict]:
+        """벡터 검색"""
+        try:
+            if not self.encoder:
+                return []
+            query_embedding = self.encoder.encode([query]).tolist()
+
+            where_filter = None
+            if category:
+                where_filter = {"category": category}
+
+            results = self.collection.query(
+                query_embeddings=query_embedding,
+                n_results=n_results,
+                where=where_filter
+            )
+
+            formatted = []
+            for i, (doc, meta) in enumerate(zip(results['documents'][0], results['metadatas'][0])):
+                formatted.append({
+                    "content": doc,
+                    "title": meta.get("title", ""),
+                    "source": meta.get("source", ""),
+                    "category": meta.get("category", ""),
+                    "rank": i + 1
+                })
+            return formatted
+        except Exception as e:
+            logger.error(f"Vector search error: {e}")
+            return []
+
+    def get_stats(self) -> Dict:
+        """통계 반환"""
+        try:
+            return {
+                "total_documents": self.collection.count(),
+                "status": "connected"
+            }
+        except:
+            return {"status": "disconnected"}
+
+
+# Global vector store
+vector_store: Optional[QualMasterVectorStore] = None
+
 
 def init_chromadb():
-    """Initialize ChromaDB connection"""
-    global chroma_client, embedding_model
+    """Initialize ChromaDB PersistentClient"""
+    global vector_store
     if not CHROMADB_AVAILABLE:
         logger.warning("ChromaDB not installed - RAG search disabled")
         return False
     try:
-        chroma_client = chromadb.HttpClient(host="localhost", port=8000)
-        # Test connection
-        chroma_client.heartbeat()
-        logger.info(f"ChromaDB connected at {CHROMA_URL}")
+        chroma_path = str(CHROMA_PATH)
+        if not CHROMA_PATH.exists():
+            logger.warning(f"ChromaDB path not found: {chroma_path}")
+            logger.warning("Run 'python init_vectordb.py' to initialize the vector database")
+            return False
 
-        if SENTENCE_TRANSFORMER_AVAILABLE:
-            embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-            logger.info("Sentence Transformer loaded")
+        vector_store = QualMasterVectorStore(chroma_path)
+        stats = vector_store.get_stats()
+        logger.info(f"ChromaDB PersistentClient connected: {stats['total_documents']} documents")
         return True
     except Exception as e:
         logger.warning(f"ChromaDB connection failed: {e}")
-        chroma_client = None
+        vector_store = None
         return False
 
 def safe_decode(text):
@@ -76,47 +146,17 @@ def safe_decode(text):
                 return text.decode('utf-8', errors='ignore')
     return str(text) if text else ""
 
-def search_chromadb(query: str, n_results: int = 5) -> List[dict]:
-    """Search ChromaDB for relevant documents"""
-    if not chroma_client:
+def search_chromadb(query: str, n_results: int = 5, category: str = None) -> List[dict]:
+    """Search ChromaDB for relevant documents using PersistentClient"""
+    if not vector_store:
         return []
 
-    results = []
-    collections_to_search = [
-        "qualmaster_methods",
-        "qualmaster_paradigms",
-        "qualmaster_traditions",
-        "qualmaster_journals",
-        "qualmaster_exemplars",
-        "qualmaster_cases"
-    ]
-
-    for coll_name in collections_to_search:
-        try:
-            collection = chroma_client.get_collection(name=coll_name)
-            query_result = collection.query(
-                query_texts=[query],
-                n_results=n_results
-            )
-
-            if query_result and query_result.get("documents"):
-                for i, doc in enumerate(query_result["documents"][0]):
-                    metadata = query_result.get("metadatas", [[]])[0][i] if query_result.get("metadatas") else {}
-                    distance = query_result.get("distances", [[]])[0][i] if query_result.get("distances") else None
-                    # Safe decode all text fields
-                    results.append({
-                        "content": safe_decode(doc),
-                        "source": safe_decode(metadata.get("source", coll_name)),
-                        "title": safe_decode(metadata.get("title", "")),
-                        "distance": distance
-                    })
-        except Exception as e:
-            logger.debug(f"Collection {coll_name} search failed: {e}")
-            continue
-
-    # Sort by distance (lower is better)
-    results.sort(key=lambda x: x.get("distance", float("inf")))
-    return results[:n_results]
+    try:
+        results = vector_store.search(query, n_results, category)
+        return results
+    except Exception as e:
+        logger.debug(f"Vector search failed: {e}")
+        return []
 
 
 # ============================================================================
@@ -661,7 +701,7 @@ def handle_search_knowledge(args: dict) -> str:
         output += rag_section
         return output
     else:
-        return f"'{original_query}'에 대한 결과를 찾을 수 없습니다.\n\n사용 가능한 카테고리: paradigms, traditions, coding, quality, journals, rejection\n\n💡 ChromaDB 연결 상태: {'✅ 연결됨' if chroma_client else '❌ 연결 안됨'}"
+        return f"'{original_query}'에 대한 결과를 찾을 수 없습니다.\n\n사용 가능한 카테고리: paradigms, traditions, coding, quality, journals, rejection\n\n💡 ChromaDB 연결 상태: {'✅ 연결됨' if vector_store else '❌ 연결 안됨'}"
 
 
 def handle_get_paradigm(args: dict) -> str:
